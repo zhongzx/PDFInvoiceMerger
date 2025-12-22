@@ -1,8 +1,12 @@
 # PDF Invoice Merger
 
+[![Download Latest Release](https://img.shields.io/badge/Download-Windows%20Exe-blue?style=for-the-badge&logo=windows)](https://github.com/zhongzx/PDFInvoiceMerger/releases/latest)
+
 [中文版 (Chinese Version)](#pdf-发票合并工具)
 
 A powerful, user-friendly tool to merge half-page PDF invoices and itineraries into single A4 pages to reduce paper waste. Designed for Windows with a clean PyQt6 interface.
+
+**[📥 Download the latest Windows executable here](https://github.com/zhongzx/PDFInvoiceMerger/releases/latest)**
 
 ## Features
 

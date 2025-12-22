@@ -7,6 +7,11 @@ __pycache__/
 dist/
 build/
 *.spec
+# Custom build folders
+build_new/
+dist_new/
+release/
+*.zip
 
 # Virtual Environment
 venv/
