@@ -28,3 +28,7 @@ merged_invoices.pdf
 # IDE
 .vscode/
 .idea/
+.DS_Store
+
+# Backup files
+*_old.py

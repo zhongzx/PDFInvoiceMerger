@@ -5,6 +5,103 @@ import shutil
 
 class PDFProcessor:
     @staticmethod
+    def identify_page(page):
+        """
+        识别页面类型并提取信息。
+        支持：
+        1. 发票 (Invoice)
+        2. 行程单 (Trip Sheet / 汇总单)
+        3. 其他 (Unrecognized)
+        
+        返回: {
+            "type": "invoice" | "trip" | "other",
+            "date": "YYYY-MM-DD",
+            "number": "string",
+            "display_text": "string",
+            "raw_text": "string"
+        }
+        """
+        import re
+        text = page.get_text()
+        raw_text = text.strip()
+        
+        info = {
+            "type": "other",
+            "date": "9999-12-31", # 默认大日期，方便排序
+            "number": "",
+            "display_text": "",
+            "raw_text": raw_text
+        }
+        
+        # 通用日期匹配 YYYY-MM-DD 或 YYYY年MM月DD日
+        date_pattern = re.compile(r'(\d{4})[-年](\d{1,2})[-月](\d{1,2})')
+        
+        def format_date(m):
+            if m:
+                year, month, day = m.groups()
+                return f"{year}-{int(month):02d}-{int(day):02d}"
+            return ""
+
+        # 1. 识别行程单 (优先，因为关键词更具体)
+        if "收费公路通行费电子票据汇总单" in text:
+            info["type"] = "trip"
+            # 提取汇总单号 (左上角)
+            num_match = re.search(r'汇总单号[:：]\s*(\d{10,25})', text)
+            if num_match:
+                info["number"] = num_match.group(1)
+            
+            # 提取日期 (右上角)
+            date_match = re.search(r'开票申请日期[:：]\s*(\d{4}[-年]\d{1,2}[-月]\d{1,2})', text)
+            if date_match:
+                info["date"] = format_date(date_pattern.search(date_match.group(1)))
+            
+            # 如果没提取到，尝试全文匹配
+            if not info["number"]:
+                # 寻找长数字
+                nums = re.findall(r'\d{12,25}', text)
+                if nums: info["number"] = nums[0]
+            if info["date"] == "9999-12-31":
+                m = date_pattern.search(text)
+                if m: info["date"] = format_date(m)
+                
+            info["display_text"] = f"行程 {info['date']} {info['number']}"
+            return info
+
+        # 2. 识别发票
+        is_invoice = False
+        if "发票" in text or "Invoice" in text:
+            is_invoice = True
+        
+        if is_invoice:
+            info["type"] = "invoice"
+            # 提取日期
+            date_match = re.search(r'开票日期[:：]\s*(\d{4}[-年]\d{1,2}[-月]\d{1,2})', text)
+            if date_match:
+                info["date"] = format_date(date_pattern.search(date_match.group(1)))
+            else:
+                m = date_pattern.search(text)
+                if m: info["date"] = format_date(m)
+            
+            # 提取发票号码
+            num_match = re.search(r'(?:发票号码|No)[:：]\s*(\d{8,20})', text)
+            if num_match:
+                info["number"] = num_match.group(1)
+            else:
+                # 备选：扫描右上角
+                inv_old = PDFProcessor.extract_invoice_info(page)
+                info["number"] = inv_old["number"]
+            
+            info["display_text"] = f"发票 {info['date']} {info['number']}"
+            return info
+
+        # 3. 其他情况
+        info["type"] = "other"
+        # 提取前10个字符
+        clean_text = re.sub(r'\s+', '', text)
+        info["display_text"] = clean_text[:10]
+        return info
+
+    @staticmethod
     def extract_invoice_info(page):
         """
         提取发票信息
@@ -243,159 +340,101 @@ class PDFProcessor:
     def merge_half_page_pdfs(input_items, output_path=None):
         """
         将多个PDF文件合并。
-        input_items: List of (file_path, page_index) or file_paths (backward compatibility)
-        
-        智能逻辑：
-        1. 排除页眉页脚干扰后，如果内容少于半页 -> 裁切掉干扰部分，拼接到半页。
-        2. 如果内容多于半页且字号大 -> 逆时针旋转90度后缩放拼接到半页。
-        3. 如果内容多于半页且字号正常 -> 独立一页，不截断。
-        4. 如果是A5或横向页面 -> 视为半页内容，不做额外裁切。
+        input_items: List of (file_path, page_index, info_dict)
         """
         src_docs = {} # cache open docs: path -> doc
         pages_to_process = []
 
         try:
-            # 1. 解析输入
+            # 1. 解析输入并预处理页面信息
+            processed_items = []
             for item in input_items:
-                if isinstance(item, tuple):
-                    path, page_idx = item
-                    if path not in src_docs:
-                        src_docs[path] = fitz.open(path)
-                    pages_to_process.append(src_docs[path][page_idx])
-                else:
-                    # Backward compatibility for list of paths
-                    path = item
-                    if path not in src_docs:
-                        src_docs[path] = fitz.open(path)
-                    for page in src_docs[path]:
-                        pages_to_process.append(page)
+                path, page_idx, info = item
+                if path not in src_docs:
+                    src_docs[path] = fitz.open(path)
+                page = src_docs[path][page_idx]
+                processed_items.append({
+                    "page": page,
+                    "info": info
+                })
 
-            if not pages_to_process:
+            if not processed_items:
                 raise ValueError("No pages found to merge.")
 
-            # 2. 创建输出文档
+            # 2. 全局排序: 日期 (升序) -> 号码 (升序)
+            processed_items.sort(key=lambda x: (x["info"].get("date", "9999-12-31"), x["info"].get("number", "")))
+
+            # 3. 创建输出文档
             doc_out = fitz.open()
             A4_WIDTH = 595
             A4_HEIGHT = 842
             HALF_HEIGHT = A4_HEIGHT / 2
             
-            # Padding definitions (approx 7mm)
+            # Padding definitions
             PADDING_X = 20
             PADDING_Y = 20
 
-            # 当前正在填充的输出页面
             current_out_page = None
             current_y_cursor = 0 
             
-            # Helper to finalize page (draw cut line if needed)
             def finalize_page_line(page_obj):
                 if page_obj:
-                    # Draw line at the exact center
                     shape = page_obj.new_shape()
                     line_y = A4_HEIGHT / 2
-                    
-                    # Ensure the line is drawn across the entire width
                     shape.draw_line(fitz.Point(0, line_y), fitz.Point(A4_WIDTH, line_y))
-                    
-                    # Style: Dash-Dot, Light Gray (0.8, 0.8, 0.8), Width 1.0
-                    # Pattern: Dash(15) - Gap(10) - Dot(2) - Gap(10)
-                    # overlay=True ensures it is drawn on top of existing content
                     shape.finish(color=(0.8, 0.8, 0.8), dashes=[15, 10, 2, 10], width=1.0)
                     shape.commit(overlay=True)
 
-            # 3. 逐页处理
-            for page in pages_to_process:
+            # 4. 逐页处理
+            for item in processed_items:
+                page = item["page"]
+                info = item["info"]
+                
                 page_rect = page.rect
                 page_w, page_h = page_rect.width, page_rect.height
                 
-                # 智能识别 A5 或 横向
-                # A5: ~420x595. If height < 600, it's small.
-                is_landscape = page_w > page_h
-                is_small_page = page_h < 600
-                
-                # 分析页面 (获取内容高度)
+                # 分析页面
                 content_h, avg_font, max_font, valid_rect = PDFProcessor.analyze_page(page)
-                
                 if valid_rect is None:
                     valid_rect = page_rect
                     content_h = page_h
 
-                # 策略判断
-                # 1. 显式的半页内容 (内容高度小)
-                # 2. 显式的 A5 页面 (页面高度小)
-                # 3. 显式的 横向页面 (适合放入半页槽)
-                is_half_page_content = (content_h <= (HALF_HEIGHT + 20)) or is_small_page or is_landscape
-                
-                strategy = "NORMAL_HALF"
-                
-                if not is_half_page_content:
-                    if (avg_font > 12 or max_font > 18) and (page_h > page_w):
-                        strategy = "ROTATE_AND_FIT"
+                strategy = "FULL_PAGE"
+                scale = 1.0
+
+                if info["type"] == "invoice":
+                    # 发票始终视为半页
+                    strategy = "HALF_PAGE"
+                    scale = 1.0 # 后面会自动计算适应宽度
+                elif info["type"] == "trip":
+                    # 行程单智能缩放
+                    # 计算要放入 HALF_HEIGHT - 2*PADDING_Y 所需的缩放比例
+                    target_h = HALF_HEIGHT - 2 * PADDING_Y
+                    target_w = A4_WIDTH - 2 * PADDING_X
+                    
+                    scale_h = target_h / valid_rect.height
+                    scale_w = target_w / valid_rect.width
+                    needed_scale = min(scale_h, scale_w)
+                    
+                    if needed_scale >= 0.8:
+                        strategy = "HALF_PAGE"
+                        scale = min(needed_scale, 1.0)
                     else:
                         strategy = "FULL_PAGE"
-                
-                # 执行策略
-                if strategy == "NORMAL_HALF":
-                    req_h = HALF_HEIGHT
-                    
-                    if current_out_page is None or (current_y_cursor + req_h > A4_HEIGHT + 10):
-                        # Finalize previous page before switching
-                        finalize_page_line(current_out_page)
-                        
-                        current_out_page = doc_out.new_page(width=A4_WIDTH, height=A4_HEIGHT)
-                        current_y_cursor = 0
-                    
-                    # 目标区域 (带 Padding)
-                    target_rect = fitz.Rect(
-                        PADDING_X, 
-                        current_y_cursor + PADDING_Y, 
-                        A4_WIDTH - PADDING_X, 
-                        current_y_cursor + req_h - PADDING_Y
-                    )
-                    
-                    # 裁剪与放置逻辑
-                    if is_small_page or is_landscape:
-                         current_out_page.show_pdf_page(target_rect, page.parent, page.number, clip=valid_rect, keep_proportion=True)
-                    else:
-                        # A4 纵向半页内容 -> 执行“去头去尾”的 Fit Width 裁剪
-                        clip_w = valid_rect.width
-                        clip_h = valid_rect.height
-                        
-                        if clip_w > 0:
-                            # 目标最大宽高
-                            max_dest_w = target_rect.width
-                            max_dest_h = target_rect.height
-                            
-                            # 计算缩放比例 (Fit Width)
-                            scale = max_dest_w / clip_w
-                            dest_h = clip_h * scale
-                            dest_w = max_dest_w # by definition of scale
-                            
-                            # 如果高度超出了，就按高度缩放
-                            if dest_h > max_dest_h:
-                                scale = max_dest_h / clip_h
-                                dest_h = max_dest_h
-                                dest_w = clip_w * scale
-                                
-                            # 居中放置
-                            x_offset = target_rect.x0 + (max_dest_w - dest_w) / 2
-                            y_offset = target_rect.y0 + (max_dest_h - dest_h) / 2
-                            
-                            real_target_rect = fitz.Rect(x_offset, y_offset, x_offset + dest_w, y_offset + dest_h)
-                                 
-                            current_out_page.show_pdf_page(real_target_rect, page.parent, page.number, clip=valid_rect)
-                        else:
-                            current_out_page.show_pdf_page(target_rect, page.parent, page.number)
+                        scale = 1.0
+                else:
+                    # 无法识别的页面（正常不应该进入这里，除非逻辑有变）
+                    strategy = "FULL_PAGE"
+                    scale = 1.0
 
-                    current_y_cursor += req_h
-                        
-                elif strategy == "ROTATE_AND_FIT":
+                # 执行放置
+                if strategy == "HALF_PAGE":
                     req_h = HALF_HEIGHT
                     if current_out_page is None or (current_y_cursor + req_h > A4_HEIGHT + 10):
                         finalize_page_line(current_out_page)
                         current_out_page = doc_out.new_page(width=A4_WIDTH, height=A4_HEIGHT)
                         current_y_cursor = 0
-                        
+                    
                     target_rect = fitz.Rect(
                         PADDING_X, 
                         current_y_cursor + PADDING_Y, 
@@ -403,27 +442,48 @@ class PDFProcessor:
                         current_y_cursor + req_h - PADDING_Y
                     )
                     
-                    # 旋转时也使用 valid_rect 裁剪以去除外框
-                    current_out_page.show_pdf_page(target_rect, page.parent, page.number, clip=valid_rect, rotate=270, keep_proportion=True)
+                    # 居中放置逻辑
+                    clip_w = valid_rect.width
+                    clip_h = valid_rect.height
+                    
+                    dest_w = clip_w * scale
+                    dest_h = clip_h * scale
+                    
+                    x_offset = target_rect.x0 + (target_rect.width - dest_w) / 2
+                    y_offset = target_rect.y0 + (target_rect.height - dest_h) / 2
+                    
+                    real_target_rect = fitz.Rect(x_offset, y_offset, x_offset + dest_w, y_offset + dest_h)
+                    current_out_page.show_pdf_page(real_target_rect, page.parent, page.number, clip=valid_rect)
                     
                     current_y_cursor += req_h
-                        
-                else: # FULL_PAGE
+                else:
+                    # FULL_PAGE: 独占一页，居中放置
                     if current_out_page is not None:
-                         finalize_page_line(current_out_page)
-                         current_out_page = None
-                         current_y_cursor = 0
+                        finalize_page_line(current_out_page)
+                        current_out_page = None
+                        current_y_cursor = 0
                     
                     new_p = doc_out.new_page(width=A4_WIDTH, height=A4_HEIGHT)
-                    new_p.show_pdf_page(new_p.rect, page.parent, page.number)
                     
-                    current_out_page = None
+                    # 计算居中缩放（保持比例）
+                    scale_w = (A4_WIDTH - 2*PADDING_X) / page_w
+                    scale_h = (A4_HEIGHT - 2*PADDING_Y) / page_h
+                    scale = min(scale_w, scale_h, 1.0) # 不放大，只缩小
+                    
+                    dest_w = page_w * scale
+                    dest_h = page_h * scale
+                    
+                    x_offset = (A4_WIDTH - dest_w) / 2
+                    y_offset = (A4_HEIGHT - dest_h) / 2
+                    
+                    target_rect = fitz.Rect(x_offset, y_offset, x_offset + dest_w, y_offset + dest_h)
+                    new_p.show_pdf_page(target_rect, page.parent, page.number)
+                    
+                    current_out_page = None # 强制下一页重新开始
                     current_y_cursor = 0
 
-            # Finalize last page
             finalize_page_line(current_out_page)
 
-            # 4. 保存或返回
             if output_path:
                 doc_out.save(output_path)
                 doc_out.close()

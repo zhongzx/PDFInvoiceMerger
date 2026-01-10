@@ -1,10 +1,11 @@
 import sys
 import os
+import re
 import fitz  # PyMuPDF
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QTreeWidget, QTreeWidgetItem, QLabel, QFileDialog, 
                              QSplitter, QMessageBox, QScrollArea, QAbstractItemView, QFrame,
-                             QTreeWidgetItemIterator)
+                             QTreeWidgetItemIterator, QMenu)
 from PyQt6.QtCore import Qt, QMimeData, QSize, pyqtSignal, QTemporaryDir, QTimer, QEvent
 from PyQt6.QtGui import QDrag, QPixmap, QImage, QIcon, QAction, QPainter, QBrush, QColor
 from PyQt6.QtPrintSupport import QPrinter, QPrintDialog, QPrintPreviewDialog
@@ -15,18 +16,17 @@ from core import PDFProcessor, ArchiveExtractor
 
 class DraggableTreeWidget(QTreeWidget):
     """
-    A QTreeWidget that supports internal reordering (top-level only) and external file drops.
+    A QTreeWidget that supports external file drops.
     """
     files_dropped = pyqtSignal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
-        self.setDragEnabled(True)
-        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setDragEnabled(False) # Disable internal drag as we use global sorting
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setHeaderHidden(True)
-        self.setIndentation(20)
+        self.setIndentation(0)
         # 增加字体大小和行间距
         self.setStyleSheet("""
             QTreeWidget {
@@ -39,75 +39,19 @@ class DraggableTreeWidget(QTreeWidget):
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Space:
-            item = self.currentItem()
-            if item:
+            items = self.selectedItems()
+            for item in items:
                 # Toggle Check State
-                # Only for page items
                 if item.data(0, Qt.ItemDataRole.UserRole).get("type") == "page":
                     current_state = item.checkState(0)
                     new_state = Qt.CheckState.Unchecked if current_state == Qt.CheckState.Checked else Qt.CheckState.Checked
                     item.setCheckState(0, new_state)
-        elif event.key() == Qt.Key.Key_Down:
-            # Handle cyclic navigation (Bottom -> Top)
-            # And skip 'file' items
-            current = self.currentItem()
-            next_item = None
-            
-            if current:
-                next_item = self.itemBelow(current)
-                # Skip file items
-                while next_item and (next_item.childCount() > 0 or next_item.data(0, Qt.ItemDataRole.UserRole).get("type") == "file"):
-                    next_item = self.itemBelow(next_item)
-            
-            if not next_item:
-                # Loop to top
-                next_item = self.topLevelItem(0)
-                # If top is file, find first valid child
-                while next_item and (next_item.childCount() > 0 or next_item.data(0, Qt.ItemDataRole.UserRole).get("type") == "file"):
-                    next_item = self.itemBelow(next_item)
-            
-            if next_item:
-                self.setCurrentItem(next_item)
-
-        elif event.key() == Qt.Key.Key_Up:
-            # Handle cyclic navigation (Top -> Bottom)
-            # And skip 'file' items
-            current = self.currentItem()
-            prev_item = None
-            
-            if current:
-                prev_item = self.itemAbove(current)
-                # Skip file items
-                while prev_item and (prev_item.childCount() > 0 or prev_item.data(0, Qt.ItemDataRole.UserRole).get("type") == "file"):
-                    prev_item = self.itemAbove(prev_item)
-            
-            if not prev_item:
-                # Loop to bottom
-                count = self.topLevelItemCount()
-                if count > 0:
-                    last = self.topLevelItem(count - 1)
-                    while last.isExpanded() and last.childCount() > 0:
-                        last = last.child(last.childCount() - 1)
-                    prev_item = last
-                    
-                    # Check if last is file (e.g. empty file), though rare
-                    while prev_item and (prev_item.childCount() > 0 or prev_item.data(0, Qt.ItemDataRole.UserRole).get("type") == "file"):
-                        prev_item = self.itemAbove(prev_item)
-            
-            if prev_item:
-                self.setCurrentItem(prev_item)
+        elif event.key() == Qt.Key.Key_Delete or event.key() == Qt.Key.Key_Backspace:
+            # Emit a signal or call parent to remove items
+            if hasattr(self.parent(), 'remove_selected_items'):
+                self.parent().remove_selected_items(self)
         else:
             super().keyPressEvent(event)
-
-    def startDrag(self, supportedActions):
-        # 强制选择父节点（文件）如果当前选中的是子节点（页面）
-        # Force dragging the file (top-level), not the page
-        item = self.currentItem()
-        if item and item.parent():
-            # It's a child (page), select the parent (file) instead
-            self.setCurrentItem(item.parent())
-        
-        super().startDrag(supportedActions)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -119,11 +63,7 @@ class DraggableTreeWidget(QTreeWidget):
         if event.mimeData().hasUrls():
             event.accept()
         else:
-            # Internal move
-            # Allow default visual feedback (insertion line)
             super().dragMoveEvent(event)
-            # Accept the event to allow dropping
-            event.accept()
 
     def dropEvent(self, event):
         if event.mimeData().hasUrls():
@@ -139,62 +79,7 @@ class DraggableTreeWidget(QTreeWidget):
             if file_paths:
                 self.files_dropped.emit(file_paths)
         else:
-            # Handle internal move - Strictly enforce flat structure
-            event.accept()
-            
-            source_item = self.currentItem()
-            if not source_item:
-                return
-            
-            # Ensure source is top-level (safety check)
-            if source_item.parent():
-                source_item = source_item.parent()
-                
-            # Find drop target
-            pos = event.position().toPoint()
-            target_item = self.itemAt(pos)
-            
-            root = self.invisibleRootItem()
-            source_index = root.indexOfChild(source_item)
-            
-            # Determine insertion index
-            target_index = -1
-            
-            if target_item:
-                # If target is a page, look at its file
-                if target_item.parent():
-                    target_item = target_item.parent()
-                
-                target_index = root.indexOfChild(target_item)
-                
-                # Get drop indicator position
-                indicator = self.dropIndicatorPosition()
-                
-                if indicator == QAbstractItemView.DropIndicatorPosition.BelowItem:
-                    target_index += 1
-                elif indicator == QAbstractItemView.DropIndicatorPosition.OnItem:
-                    # Treat "On Item" as "Insert After" (Below)
-                    target_index += 1
-                elif indicator == QAbstractItemView.DropIndicatorPosition.OnViewport:
-                    target_index = root.childCount()
-                # AboveItem: target_index stays same (insert before)
-            else:
-                # Dropped on empty space -> Append to end
-                target_index = root.childCount()
-            
-            # Execute Move
-            if source_index != target_index:
-                # Adjust index if moving downwards
-                if source_index < target_index:
-                    target_index -= 1
-                
-                # Use takeChild/insertChild to move
-                item_to_move = root.takeChild(source_index)
-                root.insertChild(target_index, item_to_move)
-                
-                # Restore selection
-                self.setCurrentItem(item_to_move)
-                item_to_move.setExpanded(True)
+            super().dropEvent(event)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -222,148 +107,409 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(QIcon(icon_path))
 
     def init_ui(self):
-        self.resize(1200, 800) # Slightly larger for better preview
-        # Global style
+        self.resize(1400, 900) 
+        self.setAcceptDrops(True) # 全窗口接收拖拽
+        
+        # 现代深色主题样式
         self.setStyleSheet("""
+            QMainWindow {
+                background-color: #1e1e1e;
+            }
             QWidget {
                 font-size: 14px;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
             }
             QPushButton {
-                padding: 8px 15px;
+                padding: 10px 20px;
+                border-radius: 6px;
+                font-weight: 500;
+                border: none;
+                transition: all 0.2s ease;
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 255, 255, 0.1);
+            }
+            QPushButton:pressed {
+                background-color: rgba(255, 255, 255, 0.05);
+            }
+            QTreeWidget {
+                font-size: 14px;
+                background-color: #2d2d2d;
+                border: 1px solid #3a3a3a;
+                border-radius: 8px;
+                padding: 5px;
+                outline: none;
+            }
+            QTreeWidget::item {
+                padding: 8px 12px;
+                border-radius: 4px;
+                margin: 2px 0;
+            }
+            QTreeWidget::item:selected {
+                background-color: #0a84ff;
+                color: white;
+            }
+            QTreeWidget::item:hover {
+                background-color: rgba(255, 255, 255, 0.1);
+            }
+            QScrollArea {
+                border: 1px solid #3a3a3a;
+                border-radius: 8px;
+                background-color: #252525;
+            }
+            QLabel {
+                color: #e0e0e0;
+            }
+            QStatusBar {
+                background-color: #1a1a1a;
+                color: #888;
+                border-top: 1px solid #333;
+            }
+            QSplitter::handle {
+                background-color: #3a3a3a;
+                width: 2px;
+            }
+            QSplitter::handle:hover {
+                background-color: #0a84ff;
             }
         """) 
         
-        # Central Widget
         central_widget = QWidget()
+        central_widget.setStyleSheet("background-color: #1e1e1e;")
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
-        main_layout.setSpacing(20) # Increase global spacing
+        main_layout.setContentsMargins(15, 15, 15, 15)
+        main_layout.setSpacing(15)
 
         # Splitter for resizable panels
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_layout.addWidget(splitter)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        main_layout.addWidget(self.splitter)
 
-        # --- Left Panel: File List & Controls ---
+        # --- Left Panel: Valid Items ---
         left_panel = QWidget()
+        left_panel.setStyleSheet("""
+            QWidget {
+                background-color: #252525;
+                border-radius: 10px;
+                padding: 10px;
+            }
+        """)
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(10)
-
-        # Tree Widget (Replaces ListWidget)
+        
+        # 左侧标题
+        left_title = QLabel("待处理文件")
+        left_title.setStyleSheet("""
+            QLabel {
+                font-size: 16px;
+                font-weight: 600;
+                color: #0a84ff;
+                padding: 10px 15px;
+                background-color: rgba(10, 132, 255, 0.1);
+                border-radius: 6px;
+                margin-bottom: 10px;
+            }
+        """)
+        left_layout.addWidget(left_title)
+        
         self.file_list = DraggableTreeWidget(self)
+        self.file_list.setHeaderHidden(True)
+        self.file_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.file_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.file_list.customContextMenuRequested.connect(self.show_valid_context_menu)
         self.file_list.itemSelectionChanged.connect(self.on_item_selected)
         self.file_list.files_dropped.connect(self.add_dropped_files)
-        self.file_list.itemChanged.connect(self.on_item_changed)
         left_layout.addWidget(self.file_list)
 
         # Statistics Label
         self.lbl_stats = QLabel()
-        self.lbl_stats.setStyleSheet("font-weight: bold; color: #333; margin: 5px 0;")
+        self.lbl_stats.setStyleSheet("""
+            QLabel {
+                font-weight: 500;
+                color: #aaa;
+                padding: 8px;
+                background-color: rgba(255, 255, 255, 0.05);
+                border-radius: 4px;
+                margin-top: 10px;
+            }
+        """)
         self.lbl_stats.setAlignment(Qt.AlignmentFlag.AlignCenter)
         left_layout.addWidget(self.lbl_stats)
 
-        # Buttons
-        btn_layout = QVBoxLayout()
-        
-        row1 = QHBoxLayout()
-        self.btn_add = QPushButton()
-        self.btn_add.clicked.connect(self.browse_files)
-        self.btn_remove = QPushButton()
-        self.btn_remove.clicked.connect(self.remove_selected_files)
-        row1.addWidget(self.btn_add)
-        row1.addWidget(self.btn_remove)
-        
-        row2 = QHBoxLayout()
-        self.btn_up = QPushButton()
-        self.btn_up.clicked.connect(self.move_item_up)
-        self.btn_down = QPushButton()
-        self.btn_down.clicked.connect(self.move_item_down)
-        row2.addWidget(self.btn_up)
-        row2.addWidget(self.btn_down)
+        # --- Middle Panel: Preview & Global Actions ---
+        middle_panel = QWidget()
+        middle_panel.setStyleSheet("""
+            QWidget {
+                background-color: #252525;
+                border-radius: 10px;
+                padding: 15px;
+            }
+        """)
+        middle_layout = QVBoxLayout(middle_panel)
+        middle_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.btn_clear = QPushButton()
-        self.btn_clear.clicked.connect(self.clear_files)
-
-        btn_layout.addLayout(row1)
-        btn_layout.addLayout(row2)
-        btn_layout.addWidget(self.btn_clear)
+        # Action Buttons (Top Bar)
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(12)
         
-        left_layout.addLayout(btn_layout)
-
-        # --- Right Panel: Preview & Actions ---
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-
-        # Action Buttons
-        action_layout = QHBoxLayout()
-        self.btn_about = QPushButton()
-        self.btn_about.clicked.connect(self.show_about)
-        
-        self.btn_lang = QPushButton()
-        self.btn_lang.clicked.connect(self.toggle_language)
+        # 主操作按钮样式
+        button_style = """
+            QPushButton {
+                padding: 12px 24px;
+                border-radius: 8px;
+                font-weight: 600;
+                font-size: 14px;
+                border: none;
+                color: white;
+                min-width: 120px;
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 255, 255, 0.1);
+                transform: translateY(-1px);
+            }
+            QPushButton:pressed {
+                transform: translateY(0);
+            }
+            QPushButton:disabled {
+                background-color: #555;
+                color: #888;
+            }
+        """
         
         self.btn_merge = QPushButton()
         self.btn_merge.clicked.connect(self.merge_files)
-        self.btn_merge.setStyleSheet("font-weight: bold; font-size: 15px; padding: 10px;")
+        self.btn_merge.setStyleSheet(button_style + """
+            QPushButton {
+                background-color: #0a84ff;
+            }
+            QPushButton:hover {
+                background-color: #0071e3;
+            }
+        """)
         
         self.btn_save = QPushButton()
         self.btn_save.clicked.connect(self.save_file)
         self.btn_save.setEnabled(False)
+        self.btn_save.setStyleSheet(button_style + """
+            QPushButton {
+                background-color: #32d74b;
+            }
+            QPushButton:hover {
+                background-color: #28a745;
+            }
+        """)
 
         self.btn_print = QPushButton()
         self.btn_print.clicked.connect(self.print_merged_file)
         self.btn_print.setEnabled(False)
-
-        action_layout.addWidget(self.btn_about)
-        action_layout.addWidget(self.btn_lang)
-        action_layout.addWidget(self.btn_merge)
-        action_layout.addWidget(self.btn_save)
-        action_layout.addWidget(self.btn_print)
+        self.btn_print.setStyleSheet(button_style + """
+            QPushButton {
+                background-color: #ff9f0a;
+            }
+            QPushButton:hover {
+                background-color: #ff9500;
+            }
+        """)
         
-        right_layout.addLayout(action_layout)
+        # 辅助按钮样式
+        aux_button_style = """
+            QPushButton {
+                padding: 8px 16px;
+                border-radius: 6px;
+                font-weight: 500;
+                background-color: rgba(255, 255, 255, 0.1);
+                color: #e0e0e0;
+                border: 1px solid rgba(255, 255, 255, 0.2);
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 255, 255, 0.2);
+            }
+        """
+        
+        self.btn_lang = QPushButton()
+        self.btn_lang.clicked.connect(self.toggle_language)
+        self.btn_lang.setStyleSheet(aux_button_style)
+        
+        self.btn_about = QPushButton()
+        self.btn_about.clicked.connect(self.show_about)
+        self.btn_about.setStyleSheet(aux_button_style)
+
+        top_bar.addWidget(self.btn_merge)
+        top_bar.addWidget(self.btn_save)
+        top_bar.addWidget(self.btn_print)
+        top_bar.addStretch()
+        top_bar.addWidget(self.btn_lang)
+        top_bar.addWidget(self.btn_about)
+        middle_layout.addLayout(top_bar)
 
         # Preview Area
+        self.lbl_preview_title = QLabel()
+        self.lbl_preview_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_preview_title.setStyleSheet("""
+            QLabel {
+                font-size: 18px;
+                font-weight: 600;
+                color: #0a84ff;
+                padding: 15px;
+                background-color: rgba(10, 132, 255, 0.1);
+                border-radius: 8px;
+                margin: 10px 0;
+            }
+        """)
+        middle_layout.addWidget(self.lbl_preview_title)
+
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.preview_container = QWidget()
         self.preview_layout = QVBoxLayout(self.preview_container)
         self.preview_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
-        self.preview_layout.setContentsMargins(10, 10, 10, 10)
         self.scroll_area.setWidget(self.preview_container)
-        self.scroll_area.installEventFilter(self)
+        middle_layout.addWidget(self.scroll_area)
+
+        # --- Right Panel: Unrecognized Items ---
+        self.right_panel = QWidget()
+        right_layout = QVBoxLayout(self.right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
         
-        self.lbl_preview_title = QLabel()
-        self.lbl_preview_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_preview_title.setStyleSheet("font-weight: bold; margin: 5px;")
+        self.lbl_unrecognized = QLabel("Unrecognized Pages")
+        self.lbl_unrecognized.setStyleSheet("font-weight: bold; color: #f44336;")
+        right_layout.addWidget(self.lbl_unrecognized)
         
-        right_layout.addWidget(self.lbl_preview_title)
-        right_layout.addWidget(self.scroll_area)
+        self.unrecognized_list = QTreeWidget()
+        self.unrecognized_list.setHeaderHidden(True)
+        self.unrecognized_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.unrecognized_list.customContextMenuRequested.connect(self.show_invalid_context_menu)
+        self.unrecognized_list.itemSelectionChanged.connect(self.on_item_selected)
+        right_layout.addWidget(self.unrecognized_list)
+        
+        # Initial State: Hide Right Panel
+        self.right_panel.setVisible(False)
 
         # Add panels to splitter
-        splitter.addWidget(left_panel)
-        splitter.addWidget(right_panel)
-        splitter.setSizes([350, 850])
+        self.splitter.addWidget(left_panel)
+        self.splitter.addWidget(middle_panel)
+        self.splitter.addWidget(self.right_panel)
+        self.splitter.setStretchFactor(1, 2) # Middle panel takes more space
 
         # Status Bar
         self.status_bar = self.statusBar()
 
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        file_paths = []
+        for url in urls:
+            path = url.toLocalFile()
+            ext = os.path.splitext(path)[1].lower()
+            if ext in ['.pdf', '.zip', '.rar', '.7z']:
+                file_paths.append(path)
+        if file_paths:
+            self.add_dropped_files(file_paths)
+
+    def show_valid_context_menu(self, pos):
+        item = self.file_list.itemAt(pos)
+        
+        pop_menu = QMenu(self)
+        if item:
+            remove_action = QAction("删除所选" if self.current_lang == 'zh' else "Remove Selected", self)
+            remove_action.triggered.connect(self.remove_selected_files)
+            pop_menu.addAction(remove_action)
+            pop_menu.addSeparator()
+        
+        clear_action = QAction("清空列表" if self.current_lang == 'zh' else "Clear All", self)
+        clear_action.triggered.connect(self.clear_all_valid)
+        pop_menu.addAction(clear_action)
+        
+        pop_menu.exec(self.file_list.viewport().mapToGlobal(pos))
+
+    def show_invalid_context_menu(self, pos):
+        item = self.unrecognized_list.itemAt(pos)
+        
+        pop_menu = QMenu(self)
+        if item:
+            remove_action = QAction("删除所选" if self.current_lang == 'zh' else "Remove Selected", self)
+            remove_action.triggered.connect(lambda: self.remove_selected_items(self.unrecognized_list))
+            pop_menu.addAction(remove_action)
+            pop_menu.addSeparator()
+            
+        clear_action = QAction("清空列表" if self.current_lang == 'zh' else "Clear All", self)
+        clear_action.triggered.connect(self.clear_unrecognized)
+        pop_menu.addAction(clear_action)
+        
+        pop_menu.exec(self.unrecognized_list.viewport().mapToGlobal(pos))
+
+    def clear_all_valid(self):
+        self.file_list.clear()
+        self.current_preview_type = None
+        self.current_preview_data = None
+        self.clear_preview()
+        self.merged_pdf_path = None
+        if self.temp_merged_doc:
+            self.temp_merged_doc.close()
+            self.temp_merged_doc = None
+        self.btn_print.setEnabled(False)
+        self.btn_save.setEnabled(False)
+        self.update_statistics()
+
+    def remove_unrecognized_item(self, item):
+        self.remove_selected_items(self.unrecognized_list)
+
+    def clear_unrecognized(self):
+        self.unrecognized_list.clear()
+        self.right_panel.setVisible(False)
+
     def update_texts(self):
         t = TRANS[self.current_lang]
         self.setWindowTitle(t['window_title'])
-        self.btn_add.setText(t['add_files'])
-        self.btn_remove.setText(t['remove'])
-        self.btn_clear.setText(t['clear'])
-        self.btn_up.setText(t['move_up'])
-        self.btn_down.setText(t['move_down'])
-        self.btn_merge.setText(t['merge'])
-        self.btn_save.setText(t['save_pdf'])
-        self.btn_print.setText(t['print'])
-        self.btn_lang.setText(t['lang_switch'])
-        self.btn_about.setText(t['about_btn'])
+        
+        # Setup all buttons with platform-specific styles and shortcuts
+        self.setup_button(self.btn_merge, 'merge')
+        self.setup_button(self.btn_save, 'save_pdf')
+        self.setup_button(self.btn_print, 'print')
+        self.setup_button(self.btn_lang, 'lang_switch')
+        self.setup_button(self.btn_about, 'about_btn')
+        
         self.lbl_preview_title.setText(t['preview_label'])
+        self.lbl_unrecognized.setText("识别失败页面" if self.current_lang == 'zh' else "Unrecognized Pages")
         self.status_bar.showMessage(t['status_ready'])
         self.update_statistics()
+
+    def setup_button(self, btn, key):
+        """
+        Sets button text and shortcuts based on the operating system.
+        - Windows: Keeps (&A) for Alt+A mnemonics.
+        - macOS: Removes (&A) and sets Cmd+A shortcut.
+        - Linux: Converts (&A) to (_A) and sets Alt+A shortcut.
+        """
+        t = TRANS[self.current_lang]
+        raw_text = t.get(key, "")
+        
+        # Extract the mnemonic letter (e.g., 'A' from 'Add (&A)')
+        match = re.search(r'\(&([A-Z])\)', raw_text)
+        letter = match.group(1) if match else ""
+        
+        if sys.platform == "darwin":
+            # macOS Style: No mnemonics in text, use Command key
+            clean_text = re.sub(r'\s*\(&[A-Z]\)', '', raw_text)
+            btn.setText(clean_text)
+            if letter:
+                btn.setShortcut(f"Cmd+{letter}")
+        elif sys.platform == "win32":
+            # Windows Style: Use & for Alt mnemonics (Qt handles this automatically)
+            btn.setText(raw_text)
+            # Clear any manual shortcut to let the mnemonic work
+            btn.setShortcut("") 
+        else:
+            # Linux Style: Show as (_P) but use Alt+P
+            # Note: Qt uses & for mnemonics on Linux too, but we format the text as requested
+            linux_text = raw_text.replace('(&', '(_').replace(')', '')
+            btn.setText(linux_text)
+            if letter:
+                # On Linux, we might need to explicitly set the Alt shortcut if using (_) format
+                btn.setShortcut(f"Alt+{letter}")
 
     def update_statistics(self):
         total_pages = 0
@@ -392,97 +538,85 @@ class MainWindow(QMainWindow):
         self.update_list_items_text()
 
     def update_list_items_text(self):
-        t = TRANS[self.current_lang]
-        iterator = QTreeWidgetItemIterator(self.file_list)
-        while iterator.value():
-            item = iterator.value()
-            data = item.data(0, Qt.ItemDataRole.UserRole)
-            if data and data.get("type") == "page":
-                # Reconstruct page text
-                page_num = data.get("page_num", 0)
-                inv_num = data.get("invoice_num", "")
-                inv_date = data.get("invoice_date", "")
-                is_invoice = data.get("is_invoice", False)
-                
-                # Concise display: Page X   Date   Number
-                # No labels like "Date:", "No:"
-                page_text = f"{t.get('page_prefix', 'Page')} {page_num+1}{t.get('page_suffix', '')}"
-                
-                if is_invoice:
-                    parts = []
-                    if inv_date:
-                        parts.append(inv_date)
-                    if inv_num:
-                        parts.append(inv_num)
-                    
-                    if parts:
-                        page_text += "   " + "   ".join(parts)
-                
-                item.setText(0, page_text)
-            iterator += 1
+        # Update both valid and invalid lists
+        for tree in [self.file_list, self.unrecognized_list]:
+            iterator = QTreeWidgetItemIterator(tree)
+            while iterator.value():
+                item = iterator.value()
+                data = item.data(0, Qt.ItemDataRole.UserRole)
+                if data and data.get("type") == "page":
+                    info = data.get("info", {})
+                    if info.get("type") == "invoice":
+                        prefix = "发票" if self.current_lang == 'zh' else "Invoice"
+                        item.setText(0, f"{prefix} {info.get('date')} {info.get('number')}")
+                    elif info.get("type") == "trip":
+                        prefix = "行程" if self.current_lang == 'zh' else "Trip"
+                        item.setText(0, f"{prefix} {info.get('date')} {info.get('number')}")
+                    else:
+                        # For "other", display_text is already extracted characters
+                        item.setText(0, info.get("display_text", ""))
+                iterator += 1
 
     def add_file_item(self, path):
         t = TRANS[self.current_lang]
         doc = None
-        pages = 0
         try:
-            # Minimalist: Just filename
-            item_text = os.path.basename(path)
-            
             doc = fitz.open(path)
-            pages = doc.page_count
-        except Exception:
-            item_text = os.path.basename(path)
-            pages = 0
-            if doc:
-                doc.close()
-                doc = None
+            for i in range(doc.page_count):
+                page = doc[i]
+                info = PDFProcessor.identify_page(page)
+                
+                # Store common data
+                item_data = {
+                    "type": "page", 
+                    "path": path, 
+                    "page_num": i,
+                    "info": info
+                }
 
-        # Parent Item (File)
-        file_item = QTreeWidgetItem(self.file_list)
-        file_item.setText(0, item_text)
-        file_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "file", "path": path})
-        file_item.setToolTip(0, path)
+                if info["type"] == "other":
+                    # Add to right list
+                    item = QTreeWidgetItem(self.unrecognized_list)
+                    item.setText(0, info["display_text"])
+                    item.setData(0, Qt.ItemDataRole.UserRole, item_data)
+                    self.right_panel.setVisible(True)
+                else:
+                    # Add to left list
+                    item = QTreeWidgetItem(self.file_list)
+                    # Use localized prefix
+                    prefix = "发票" if self.current_lang == 'zh' else "Invoice"
+                    if info["type"] == "trip":
+                        prefix = "行程" if self.current_lang == 'zh' else "Trip"
+                    
+                    item.setText(0, f"{prefix} {info['date']} {info['number']}")
+                    item.setCheckState(0, Qt.CheckState.Checked)
+                    item.setData(0, Qt.ItemDataRole.UserRole, item_data)
+                    
+            # Auto sort left list
+            self.sort_valid_list()
+            
+        except Exception as e:
+            print(f"Error adding file {path}: {e}")
+        finally:
+            if doc: doc.close()
+
+    def sort_valid_list(self):
+        """
+        根据日期和号码对左侧列表进行全局排序。
+        """
+        items = []
+        root = self.file_list.invisibleRootItem()
+        for i in range(root.childCount()):
+            items.append(root.takeChild(0))
+            
+        # 排序逻辑: 日期 (升序) -> 号码 (升序)
+        items.sort(key=lambda x: (
+            x.data(0, Qt.ItemDataRole.UserRole)["info"].get("date", "9999-12-31"),
+            x.data(0, Qt.ItemDataRole.UserRole)["info"].get("number", "")
+        ))
         
-        # Child Items (Pages)
-        if pages > 0 and doc:
-            try:
-                for i in range(pages):
-                    page = doc[i]
-                    # 尝试提取发票信息
-                    inv_info = PDFProcessor.extract_invoice_info(page)
-                    
-                    # Concise display
-                    page_text = f"{t.get('page_prefix', 'Page')} {i+1}{t.get('page_suffix', '')}"
-                    if inv_info["is_invoice"]:
-                        parts = []
-                        if inv_info["date"]:
-                            parts.append(inv_info["date"])
-                        if inv_info["number"]:
-                            parts.append(inv_info["number"])
-                        
-                        if parts:
-                            page_text += "   " + "   ".join(parts)
-                    
-                    page_item = QTreeWidgetItem(file_item)
-                    page_item.setText(0, page_text)
-                    
-                    # Store invoice number in data for duplicate checking
-                    item_data = {
-                        "type": "page", 
-                        "path": path, 
-                        "page_num": i,
-                        "invoice_num": inv_info.get("number", ""),
-                        "invoice_date": inv_info.get("date", ""),
-                        "is_invoice": inv_info.get("is_invoice", False)
-                    }
-                    page_item.setData(0, Qt.ItemDataRole.UserRole, item_data)
-                    page_item.setCheckState(0, Qt.CheckState.Checked)
-            finally:
-                doc.close()
-
-        # Default expand the item
-        file_item.setExpanded(True)
+        for item in items:
+            root.addChild(item)
 
     def on_item_changed(self, item, column):
         self.check_duplicates()
@@ -523,7 +657,8 @@ class MainWindow(QMainWindow):
                 item.setToolTip(0, "")
 
                 if data and data.get("type") == "page":
-                    inv_num = data.get("invoice_num")
+                    info = data.get("info", {})
+                    inv_num = info.get("number")
                     if inv_num:
                         if inv_num not in inv_map:
                             inv_map[inv_num] = []
@@ -610,76 +745,25 @@ class MainWindow(QMainWindow):
             print(f"Archive error: {e}")
             QMessageBox.warning(self, t.get('archive_error_title', "Archive Error"), f"{str(e)}")
 
-    def browse_files(self):
-        t = TRANS[self.current_lang]
-        files, _ = QFileDialog.getOpenFileNames(self, t['add_files'], "", t['file_filter'])
-        if files:
-            self.file_list.blockSignals(True)
-            try:
-                for f in files:
-                    self.add_file_item(f)
-            finally:
-                self.file_list.blockSignals(False)
+    def remove_selected_items(self, tree_widget):
+        items = tree_widget.selectedItems()
+        if not items:
+            return
+            
+        root = tree_widget.invisibleRootItem()
+        for item in items:
+            (item.parent() or root).removeChild(item)
+            
+        if tree_widget == self.unrecognized_list:
+            if self.unrecognized_list.topLevelItemCount() == 0:
+                self.right_panel.setVisible(False)
+        else:
             self.check_duplicates()
             self.update_statistics()
+            self.clear_preview()
 
     def remove_selected_files(self):
-        # Only remove top-level items for now to avoid confusion
-        item = self.file_list.currentItem()
-        if not item:
-            return
-            
-        # If it's a page, remove its parent? Or do nothing?
-        # User implies managing files.
-        if item.parent():
-            # It's a page. Let's select the parent to make it easier to remove the file?
-            # Or just ignore.
-            pass
-        else:
-            # It's a file
-            index = self.file_list.indexOfTopLevelItem(item)
-            self.file_list.takeTopLevelItem(index)
-            self.check_duplicates()
-            self.update_statistics()
-            
-        self.clear_preview()
-
-    def clear_files(self):
-        self.file_list.clear()
-        
-        self.current_preview_type = None
-        self.current_preview_data = None
-        
-        self.clear_preview()
-        self.merged_pdf_path = None
-        if self.temp_merged_doc:
-            self.temp_merged_doc.close()
-            self.temp_merged_doc = None
-        self.btn_print.setEnabled(False)
-        self.btn_save.setEnabled(False)
-        self.update_statistics()
-
-    def move_item_up(self):
-        item = self.file_list.currentItem()
-        if not item or item.parent():
-            return # Only move top-level files
-            
-        index = self.file_list.indexOfTopLevelItem(item)
-        if index > 0:
-            item = self.file_list.takeTopLevelItem(index)
-            self.file_list.insertTopLevelItem(index - 1, item)
-            self.file_list.setCurrentItem(item)
-
-    def move_item_down(self):
-        item = self.file_list.currentItem()
-        if not item or item.parent():
-            return
-            
-        index = self.file_list.indexOfTopLevelItem(item)
-        if index < self.file_list.topLevelItemCount() - 1:
-            item = self.file_list.takeTopLevelItem(index)
-            self.file_list.insertTopLevelItem(index + 1, item)
-            self.file_list.setCurrentItem(item)
+        self.remove_selected_items(self.file_list)
 
     def eventFilter(self, source, event):
         if source == self.scroll_area and event.type() == QEvent.Type.Resize:
@@ -796,64 +880,36 @@ class MainWindow(QMainWindow):
     def merge_files(self):
         t = TRANS[self.current_lang]
         
-        # Check conflicts
-        if self.has_conflicts:
-             QMessageBox.warning(self, t['window_title'], t.get('error_conflict', "Duplicate conflicts detected."))
-             return
-
-        count = self.file_list.topLevelItemCount()
-        if count == 0:
-            QMessageBox.warning(self, t['window_title'], t['error_no_files'])
+        # 收集所有选中的有效页面
+        pages_to_merge = []
+        iterator = QTreeWidgetItemIterator(self.file_list)
+        while iterator.value():
+            item = iterator.value()
+            if item.checkState(0) == Qt.CheckState.Checked:
+                data = item.data(0, Qt.ItemDataRole.UserRole)
+                pages_to_merge.append((data["path"], data["page_num"], data["info"]))
+            iterator += 1
+            
+        if not pages_to_merge:
+            QMessageBox.warning(self, t['confirm_title'], t['error_no_files'])
             return
 
-        input_items = []
-        for i in range(count):
-            file_item = self.file_list.topLevelItem(i)
-            # Check if file itself is checked or has checked children
-            # If file has children (pages), we respect page checks.
-            # If file has no children (weird case), we check file state.
-            
-            if file_item.childCount() > 0:
-                for j in range(file_item.childCount()):
-                    page_item = file_item.child(j)
-                    if page_item.checkState(0) == Qt.CheckState.Checked:
-                        data = page_item.data(0, Qt.ItemDataRole.UserRole)
-                        if data:
-                            input_items.append((data['path'], data['page_num']))
-            else:
-                # Fallback for files without page info (shouldn't happen with current logic)
-                if file_item.checkState(0) == Qt.CheckState.Checked:
-                    data = file_item.data(0, Qt.ItemDataRole.UserRole)
-                    if data:
-                        input_items.append(data['path'])
-
-        if not input_items:
-             QMessageBox.warning(self, t['window_title'], "No pages selected for merge.")
-             return
-
-        self.status_bar.showMessage(t['status_processing'])
-        QApplication.processEvents()
-
         try:
-            # Use Core Logic - No output path, returns fitz.Document
-            if self.temp_merged_doc:
-                self.temp_merged_doc.close() # Close previous if exists
+            self.status_bar.showMessage(t['status_processing'])
             
-            # The core logic handles opening files itself
-            self.temp_merged_doc = PDFProcessor.merge_half_page_pdfs(input_items)
+            # 生成合并后的 PDF 文档对象
+            self.temp_merged_doc = PDFProcessor.merge_half_page_pdfs(pages_to_merge)
             
-            # Show Preview
-            self.show_doc_preview(self.temp_merged_doc)
+            # 更新预览
+            self.refresh_preview()
             
-        # Enable actions
             self.btn_save.setEnabled(True)
             self.btn_print.setEnabled(True)
-            
             self.status_bar.showMessage(t['status_ready'])
             
         except Exception as e:
-            self.status_bar.showMessage(t['status_error'].format(str(e)))
-            QMessageBox.critical(self, "Error", str(e))
+            QMessageBox.critical(self, t['confirm_title'], t['status_error'].format(str(e)))
+            traceback.print_exc()
 
     def save_file(self):
         if not self.temp_merged_doc:
@@ -879,6 +935,7 @@ class MainWindow(QMainWindow):
         # Instead of QPrintPreviewDialog, we open the file with the system default viewer
         # This provides the best "native" preview and print experience
         import tempfile
+        import subprocess
         try:
             # Create a temp file
             fd, temp_path = tempfile.mkstemp(suffix=".pdf")
@@ -886,8 +943,13 @@ class MainWindow(QMainWindow):
             
             self.temp_merged_doc.save(temp_path)
             
-            # Open with default system application (Windows)
-            os.startfile(temp_path)
+            # Cross-platform open
+            if sys.platform == 'win32':
+                os.startfile(temp_path)
+            elif sys.platform == 'darwin':
+                subprocess.call(['open', temp_path])
+            else:
+                subprocess.call(['xdg-open', temp_path])
             
         except Exception as e:
              QMessageBox.critical(self, "Error", f"Failed to open system preview: {str(e)}")
