@@ -1,6 +1,6 @@
 # PDF Invoice Merger
 
-[![Download Latest Release](https://img.shields.io/badge/Download-Windows%20Exe-blue?style=for-the-badge&logo=windows)](https://github.com/zhongzx/PDFInvoiceMerger/releases/latest)
+[![Download Latest Release](https://img.shields.io/badge/Download-Latest%20Release-blue?style=for-the-badge&logo=github)](https://github.com/zhongzx/PDFInvoiceMerger/releases/latest)
 
 [中文版 (Chinese Version)](#pdf-发票合并工具)
 
@@ -31,6 +31,20 @@ A powerful, user-friendly tool to merge half-page PDF invoices and itineraries i
     pip install -r requirements.txt
     ```
     *(Note: Requires `PyQt6`, `pymupdf`, `patool`)*
+
+## Build (Developers)
+
+1.  Install build dependencies:
+    ```bash
+    pip install -r requirements.txt -r requirements-build.txt
+    ```
+2.  Build release artifact:
+    ```bash
+    python build_release.py
+    ```
+3.  Output:
+    *   `dist_artifacts/` (packaged release files)
+    *   `dist/` (PyInstaller output)
 
 ## Usage
 
@@ -84,6 +98,20 @@ A powerful, user-friendly tool to merge half-page PDF invoices and itineraries i
     pip install -r requirements.txt
     ```
     *(注意：需要 `PyQt6`, `pymupdf`, `patool`)*
+
+## 构建（开发者）
+
+1.  安装构建依赖：
+    ```bash
+    pip install -r requirements.txt -r requirements-build.txt
+    ```
+2.  打包 release 文件：
+    ```bash
+    python build_release.py
+    ```
+3.  输出目录：
+    *   `dist_artifacts/`（最终可发布文件）
+    *   `dist/`（PyInstaller 输出目录）
 
 ## 使用指南
 

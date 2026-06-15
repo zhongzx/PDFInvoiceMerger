@@ -9,12 +9,15 @@ build/
 *.spec
 # Custom build folders
 build_new/
+build_ci/
 dist_new/
+dist_artifacts/
 release/
 *.zip
 
 # Virtual Environment
 venv/
+.venv/
 env/
 .env
 
