@@ -1,7 +1,7 @@
 import os
 import subprocess
-import sys
 from PIL import Image
+
 
 def create_ico():
     """Convert assets/icon.png to assets/icon.ico for the executable icon."""
@@ -21,6 +21,7 @@ def create_ico():
         print(f"Failed to create .ico file: {e}")
         return None
 
+
 def build_exe():
     """Run PyInstaller to build the executable."""
     ico_path = create_ico()
@@ -36,7 +37,7 @@ def build_exe():
         "--name", "PDFInvoiceMerger",
         "--icon", ico_path,
         "--add-data", f"assets{os.pathsep}assets",  # Include assets folder
-        "--hidden-import", "patool",
+        "--hidden-import", "patoolib",
         "--clean",
         "main.py"
     ]
@@ -47,12 +48,14 @@ def build_exe():
     try:
         subprocess.check_call(args)
         print("\nBuild successful!")
-        print(f"Executable found in: {os.path.join(os.getcwd(), 'dist', 'PDFInvoiceMerger.exe')}")
+        dist_path = os.path.join(os.getcwd(), "dist", "PDFInvoiceMerger.exe")
+        print(f"Executable found in: {dist_path}")
         print("\nNOTE: This executable was built with Python 3.11.")
         print("It will run on Windows 10 and Windows 11.")
         print("It will NOT run on Windows 7 (requires Python 3.8 or older).")
     except subprocess.CalledProcessError as e:
         print(f"\nBuild failed with error: {e}")
+
 
 if __name__ == "__main__":
     build_exe()
