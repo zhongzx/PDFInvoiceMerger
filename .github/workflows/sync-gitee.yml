@@ -26,6 +26,7 @@ jobs:
           GITEE_REPO: ${{ secrets.GITEE_REPO }}
         run: |
           set -euo pipefail
+          git fetch --prune --tags origin "+refs/heads/*:refs/heads/*"
           if git remote get-url gitee >/dev/null 2>&1; then
             git remote remove gitee
           fi
