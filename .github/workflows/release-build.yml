@@ -71,12 +71,13 @@ jobs:
           GITEE_REPO: ${{ secrets.GITEE_REPO }}
         run: |
           set -euo pipefail
-          git fetch --prune --tags origin "+refs/heads/*:refs/heads/*"
+          git fetch --prune --tags origin
+          git fetch origin main:refs/heads/main --force
           if git remote get-url gitee >/dev/null 2>&1; then
             git remote remove gitee
           fi
           git remote add gitee "https://oauth2:${GITEE_TOKEN}@gitee.com/${GITEE_OWNER}/${GITEE_REPO}.git"
-          git push gitee --prune --all
+          git push gitee --prune "refs/heads/main:refs/heads/main"
           git push gitee --prune --tags
 
       - name: Sync Gitee Release
