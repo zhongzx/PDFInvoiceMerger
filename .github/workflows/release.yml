@@ -1,0 +1,156 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - ubuntu-latest
+          - macos-14
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Build
+        run: python build_release.py
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}
+          path: dist_artifacts/*
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release_artifacts
+
+      - name: List artifacts
+        run: ls -R release_artifacts
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release_artifacts/**/*
+
+      - name: Sync code to Gitee
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
+          GITEE_REPO: ${{ secrets.GITEE_REPO }}
+        run: |
+          set -euo pipefail
+          git fetch --prune --tags origin
+          git fetch origin main --depth=1
+          main_sha="$(git rev-parse FETCH_HEAD)"
+          if git remote get-url gitee >/dev/null 2>&1; then
+            git remote remove gitee
+          fi
+          git remote add gitee "https://oauth2:${GITEE_TOKEN}@gitee.com/${GITEE_OWNER}/${GITEE_REPO}.git"
+          git push gitee --prune "${main_sha}:refs/heads/main"
+          git push gitee --prune --tags
+
+      - name: Sync Gitee Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
+          GITEE_REPO: ${{ secrets.GITEE_REPO }}
+        run: |
+          set -euo pipefail
+
+          tag_name="${GITHUB_REF_NAME}"
+
+          gh_release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag_name}")"
+          release_name="$(echo "$gh_release_json" | jq -r '.name // .tag_name')"
+          release_body="$(echo "$gh_release_json" | jq -r '.body // ""')"
+
+          api_base="https://gitee.com/api/v5"
+
+          gitee_releases="$(
+            curl -sS \
+              "${api_base}/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}&per_page=100"
+          )"
+          gitee_release_id="$(
+            echo "$gitee_releases" \
+              | jq -r --arg tag_name "$tag_name" '.[] | select(.tag_name == $tag_name) | .id' \
+              | head -n 1
+          )"
+
+          payload="$(
+            jq -n \
+              --arg access_token "$GITEE_TOKEN" \
+              --arg tag_name "$tag_name" \
+              --arg name "$release_name" \
+              --arg body "$release_body" \
+              '{access_token: $access_token, tag_name: $tag_name, name: $name, body: $body, prerelease: false}'
+          )"
+
+          if [ -z "${gitee_release_id}" ] || [ "${gitee_release_id}" = "null" ]; then
+            create_resp="$(
+              curl -sS -X POST \
+                -H "Content-Type: application/json" \
+                -d "$payload" \
+                "${api_base}/repos/${GITEE_OWNER}/${GITEE_REPO}/releases"
+            )"
+            gitee_release_id="$(echo "$create_resp" | jq -r '.id')"
+          else
+            curl -sS -X PATCH \
+              -H "Content-Type: application/json" \
+              -d "$payload" \
+              "${api_base}/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${gitee_release_id}" \
+              >/dev/null
+          fi
+
+          gitee_assets="$(
+            curl -sS \
+              "${api_base}/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${gitee_release_id}/attach_files?access_token=${GITEE_TOKEN}&per_page=100"
+          )"
+
+          find release_artifacts -type f -print0 | while IFS= read -r -d '' file_path; do
+            file_name="$(basename "$file_path")"
+
+            if echo "$gitee_assets" | jq -e --arg file_name "$file_name" '.[] | select(.name == $file_name)' >/dev/null 2>&1; then
+              continue
+            fi
+
+            curl -sS -X POST \
+              -F "access_token=${GITEE_TOKEN}" \
+              -F "file=@${file_path}" \
+              "${api_base}/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${gitee_release_id}/attach_files" \
+              >/dev/null
+          done
