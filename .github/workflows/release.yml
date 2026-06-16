@@ -74,6 +74,7 @@ jobs:
           GITEE_REPO: ${{ secrets.GITEE_REPO }}
         run: |
           set -euo pipefail
+          tag_name="${GITHUB_REF_NAME}"
           git fetch --prune --tags origin
           git fetch origin main --depth=1
           main_sha="$(git rev-parse FETCH_HEAD)"
@@ -82,7 +83,8 @@ jobs:
           fi
           git remote add gitee "https://oauth2:${GITEE_TOKEN}@gitee.com/${GITEE_OWNER}/${GITEE_REPO}.git"
           git push gitee --prune "${main_sha}:refs/heads/main"
-          git push gitee --prune --tags
+          git push gitee ":refs/tags/${tag_name}" || true
+          git push gitee "refs/tags/${tag_name}:refs/tags/${tag_name}"
 
       - name: Sync Gitee Release
         env:
