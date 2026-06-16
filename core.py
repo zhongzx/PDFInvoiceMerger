@@ -2,6 +2,7 @@ import os
 import fitz  # PyMuPDF
 import patoolib
 import shutil
+from typing import Dict, Optional, Sequence, Tuple, Union
 
 class PDFProcessor:
     @staticmethod
@@ -204,7 +205,9 @@ class PDFProcessor:
         return info
 
     @staticmethod
-    def analyze_page(page):
+    def analyze_page(
+        page: fitz.Page, ignore_top: float = 50, ignore_bottom: float = 50
+    ) -> Tuple[float, float, float, Optional[fitz.Rect]]:
         """
         分析页面内容，返回 (有效内容高度, 平均字号, 最大字号, 有效内容区域Rect)
         有效内容区域：排除了顶部和底部可能的干扰文本（如打印标记），并且尝试去除"棕色外框"。
@@ -220,10 +223,6 @@ class PDFProcessor:
         page_h = page_rect.height
         page_w = page_rect.width
         
-        # 定义忽略区域（顶部和底部各 50pt，约 1.7cm）
-        IGNORE_TOP = 50
-        IGNORE_BOTTOM = 50
-        
         valid_blocks = []
         font_sizes = []
         
@@ -234,7 +233,7 @@ class PDFProcessor:
             # 过滤掉顶部和底部的干扰内容 (仅针对文本)
             # 图片块(type=1)通常是重要的，保留
             if b["type"] == 0:
-                if bbox[3] < IGNORE_TOP or bbox[1] > (page_h - IGNORE_BOTTOM):
+                if bbox[3] < ignore_top or bbox[1] > (page_h - ignore_bottom):
                     continue
             
                 # 收集字号信息
@@ -245,7 +244,7 @@ class PDFProcessor:
             # 如果是图片，且不在极端边缘，也保留
             elif b["type"] == 1:
                 # 图片通常不应该被忽略，除非它完全在忽略区
-                 if bbox[3] < 10 or bbox[1] > (page_h - 10):
+                if bbox[3] < 10 or bbox[1] > (page_h - 10):
                     continue
         
             valid_blocks.append(b)
@@ -274,7 +273,7 @@ class PDFProcessor:
                 
                 # 否则，认为是有效内容（如表格线），加入边界计算
                 # 过滤掉极端边缘的线条（可能是打印裁切线）
-                if path_rect.y1 < IGNORE_TOP or path_rect.y0 > (page_h - IGNORE_BOTTOM):
+                if path_rect.y1 < ignore_top or path_rect.y0 > (page_h - ignore_bottom):
                     continue
                     
                 valid_drawings_rects.append(path_rect)
@@ -337,7 +336,10 @@ class PDFProcessor:
         return content_h, avg_font, max_font, valid_rect
 
     @staticmethod
-    def merge_half_page_pdfs(input_items, output_path=None):
+    def merge_half_page_pdfs(
+        input_items: Sequence[Tuple[str, int, Dict[str, str]]],
+        output_path: Optional[str] = None,
+    ) -> Union[str, fitz.Document]:
         """
         将多个PDF文件合并。
         input_items: List of (file_path, page_index, info_dict)
@@ -394,7 +396,14 @@ class PDFProcessor:
                 page_w, page_h = page_rect.width, page_rect.height
                 
                 # 分析页面
-                content_h, avg_font, max_font, valid_rect = PDFProcessor.analyze_page(page)
+                if info["type"] == "invoice":
+                    content_h, avg_font, max_font, valid_rect = PDFProcessor.analyze_page(
+                        page, ignore_top=0
+                    )
+                else:
+                    content_h, avg_font, max_font, valid_rect = PDFProcessor.analyze_page(
+                        page
+                    )
                 if valid_rect is None:
                     valid_rect = page_rect
                     content_h = page_h
